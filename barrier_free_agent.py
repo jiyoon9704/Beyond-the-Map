@@ -13,6 +13,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from openai import OpenAI
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 @dataclass
@@ -35,9 +38,9 @@ class Route:
 
 
 class GoogleDirectionsMapAPI:
-    """Google Directions API adapter."""
+    """Google Routes API (Directions v2) adapter."""
 
-    DIRECTIONS_URL = "https://maps.googleapis.com/maps/api/directions/json"
+    ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
 
     def __init__(
         self,
@@ -61,7 +64,7 @@ class GoogleDirectionsMapAPI:
     def _strip_html(text: str) -> str:
         out = text
         replacements = {
-            "<div style=\"font-size:0.9em\">": " ",
+            '<div style="font-size:0.9em">': " ",
             "</div>": " ",
             "<b>": "",
             "</b>": "",
@@ -72,12 +75,35 @@ class GoogleDirectionsMapAPI:
         return " ".join(out.split())
 
     @staticmethod
-    def _bearing(start_lat: float, start_lng: float, end_lat: float, end_lng: float) -> int:
+    def _parse_duration_seconds(duration_text: str) -> int:
+        # Routes API returns duration as a protobuf string, e.g. "742s".
+        if not duration_text:
+            return 0
+        if duration_text.endswith("s"):
+            duration_text = duration_text[:-1]
+        try:
+            return int(float(duration_text))
+        except ValueError:
+            return 0
+
+    def _travel_mode_for_routes_api(self) -> str:
+        mapping = {
+            "walking": "WALK",
+            "bicycling": "BICYCLE",
+        }
+        return mapping.get(self.mode, "WALK")
+
+    @staticmethod
+    def _bearing(
+        start_lat: float, start_lng: float, end_lat: float, end_lng: float
+    ) -> int:
         lat1 = math.radians(start_lat)
         lat2 = math.radians(end_lat)
         d_lon = math.radians(end_lng - start_lng)
         x = math.sin(d_lon) * math.cos(lat2)
-        y = math.cos(lat1) * math.sin(lat2) - (math.sin(lat1) * math.cos(lat2) * math.cos(d_lon))
+        y = math.cos(lat1) * math.sin(lat2) - (
+            math.sin(lat1) * math.cos(lat2) * math.cos(d_lon)
+        )
         initial = math.degrees(math.atan2(x, y))
         return int((initial + 360) % 360)
 
@@ -88,36 +114,61 @@ class GoogleDirectionsMapAPI:
         d_lon = math.radians(lon2 - lon1)
         a = (
             math.sin(d_lat / 2) ** 2
-            + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(d_lon / 2) ** 2
+            + math.cos(math.radians(lat1))
+            * math.cos(math.radians(lat2))
+            * math.sin(d_lon / 2) ** 2
         )
         return 2 * r * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-    def _is_near_blocked_point(self, segment: Segment, blocked_points: List[Tuple[float, float]]) -> bool:
+    def _is_near_blocked_point(
+        self, segment: Segment, blocked_points: List[Tuple[float, float]]
+    ) -> bool:
         for b_lat, b_lng in blocked_points:
-            if self._haversine_m(segment.lat, segment.lng, b_lat, b_lng) <= self.blocked_radius_m:
+            if (
+                self._haversine_m(segment.lat, segment.lng, b_lat, b_lng)
+                <= self.blocked_radius_m
+            ):
                 return True
         return False
 
-    def get_routes(self, blocked_points: Optional[List[Tuple[float, float]]] = None) -> List[Route]:
+    def get_routes(
+        self, blocked_points: Optional[List[Tuple[float, float]]] = None
+    ) -> List[Route]:
         blocked_points = blocked_points or []
-        params = {
-            "origin": self.origin,
-            "destination": self.destination,
-            "mode": self.mode,
-            "alternatives": "true",
-            "language": self.language,
-            "region": self.region,
-            "key": self.api_key,
+        headers = {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": self.api_key,
+            "X-Goog-FieldMask": (
+                "routes.duration,routes.distanceMeters,routes.description,"
+                "routes.legs.steps.startLocation,routes.legs.steps.endLocation,"
+                "routes.legs.steps.navigationInstruction.instructions"
+            ),
+        }
+        body = {
+            "origin": {"address": self.origin},
+            "destination": {"address": self.destination},
+            "travelMode": self._travel_mode_for_routes_api(),
+            "computeAlternativeRoutes": True,
+            "languageCode": self.language,
+            "regionCode": self.region.upper(),
+            "units": "METRIC",
         }
 
-        resp = requests.get(self.DIRECTIONS_URL, params=params, timeout=30)
-        resp.raise_for_status()
-        payload = resp.json()
-
-        status = payload.get("status")
-        if status != "OK":
-            msg = payload.get("error_message") or "Directions API 호출 실패"
-            raise RuntimeError(f"Google Directions 오류: {status} - {msg}")
+        resp = requests.post(self.ROUTES_URL, headers=headers, json=body, timeout=30)
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = {}
+        if resp.status_code >= 400:
+            error = payload.get("error", {})
+            code = error.get("status", f"HTTP_{resp.status_code}")
+            msg = error.get("message", resp.text[:300])
+            raise RuntimeError(f"Google Routes 오류: {code} - {msg}")
+        if "error" in payload:
+            error = payload.get("error", {})
+            code = error.get("status", "UNKNOWN")
+            msg = error.get("message", "Routes API 호출 실패")
+            raise RuntimeError(f"Google Routes 오류: {code} - {msg}")
 
         routes: List[Route] = []
         for r_idx, r in enumerate(payload.get("routes", []), start=1):
@@ -131,14 +182,15 @@ class GoogleDirectionsMapAPI:
 
             segments: List[Segment] = []
             for s_idx, step in enumerate(steps, start=1):
-                start_loc = step.get("start_location", {})
-                end_loc = step.get("end_location", {})
+                start_loc = step.get("startLocation", {}).get("latLng", {})
+                end_loc = step.get("endLocation", {}).get("latLng", {})
                 lat = float(start_loc.get("lat", 0.0))
                 lng = float(start_loc.get("lng", 0.0))
                 end_lat = float(end_loc.get("lat", lat))
                 end_lng = float(end_loc.get("lng", lng))
                 heading = self._bearing(lat, lng, end_lat, end_lng)
-                name = self._strip_html(step.get("html_instructions", f"step_{s_idx}"))
+                nav = step.get("navigationInstruction", {})
+                name = self._strip_html(nav.get("instructions", f"step_{s_idx}"))
 
                 segments.append(
                     Segment(
@@ -154,12 +206,14 @@ class GoogleDirectionsMapAPI:
             if not segments:
                 continue
 
-            if blocked_points and any(self._is_near_blocked_point(seg, blocked_points) for seg in segments):
+            if blocked_points and any(
+                self._is_near_blocked_point(seg, blocked_points) for seg in segments
+            ):
                 continue
 
-            summary = r.get("summary") or "Google Directions 경로"
-            distance_m = int(leg.get("distance", {}).get("value", 0))
-            duration_s = int(leg.get("duration", {}).get("value", 0))
+            summary = r.get("description") or "Google Routes 경로"
+            distance_m = int(r.get("distanceMeters", 0))
+            duration_s = self._parse_duration_seconds(r.get("duration", "0s"))
             routes.append(
                 Route(
                     id=f"R{r_idx}",
@@ -256,9 +310,13 @@ def analyze_with_vlm(client: OpenAI, model: str, image_input: str) -> Dict[str, 
     return extract_json_block(output_text)
 
 
-def print_segment_result(segment: Segment, local_image_path: Path, result: Dict[str, Any]) -> None:
+def print_segment_result(
+    segment: Segment, local_image_path: Path, result: Dict[str, Any]
+) -> None:
     obstacles = result.get("obstacles", [])
-    obstacle_text = ", ".join(o.get("type", "unknown") for o in obstacles) if obstacles else "없음"
+    obstacle_text = (
+        ", ".join(o.get("type", "unknown") for o in obstacles) if obstacles else "없음"
+    )
     print(f"  - 세그먼트: {segment.id} ({segment.name})")
     print(f"    이미지: {local_image_path}")
     print(
@@ -268,7 +326,9 @@ def print_segment_result(segment: Segment, local_image_path: Path, result: Dict[
     print(f"    요약: {result.get('summary', '')}")
 
 
-def write_report(run_dir: Path, attempts: List[Dict[str, Any]], selected: Optional[Dict[str, Any]]) -> Path:
+def write_report(
+    run_dir: Path, attempts: List[Dict[str, Any]], selected: Optional[Dict[str, Any]]
+) -> Path:
     lines: List[str] = ["# Barrier-Free Navigation Report", ""]
     lines.append(f"- generated_at: {datetime.now().isoformat(timespec='seconds')}")
     lines.append("")
@@ -292,7 +352,9 @@ def write_report(run_dir: Path, attempts: List[Dict[str, Any]], selected: Option
             lines.append("")
 
         if attempt["blocked_segments"]:
-            lines.append(f"- blocked_segments: {', '.join(attempt['blocked_segments'])}")
+            lines.append(
+                f"- blocked_segments: {', '.join(attempt['blocked_segments'])}"
+            )
         else:
             lines.append("- blocked_segments: none")
         lines.append("")
@@ -330,7 +392,9 @@ def run(args: argparse.Namespace) -> None:
         raise RuntimeError("OPENAI_API_KEY를 설정하거나 --openai-api-key를 전달하세요.")
 
     if not args.google_maps_api_key and not os.getenv("GOOGLE_MAPS_API_KEY"):
-        raise RuntimeError("GOOGLE_MAPS_API_KEY를 설정하거나 --google-maps-api-key를 전달하세요.")
+        raise RuntimeError(
+            "GOOGLE_MAPS_API_KEY를 설정하거나 --google-maps-api-key를 전달하세요."
+        )
 
     openai_key = args.openai_api_key or os.getenv("OPENAI_API_KEY")
     google_key = args.google_maps_api_key or os.getenv("GOOGLE_MAPS_API_KEY")
@@ -369,7 +433,9 @@ def run(args: argparse.Namespace) -> None:
             break
 
         route = candidates[0]
-        print(f"\n[Loop {loop_idx}] 지도 API 1차 경로: {route.id} ({route.title}, {route.distance_m}m)")
+        print(
+            f"\n[Loop {loop_idx}] 지도 API 1차 경로: {route.id} ({route.title}, {route.distance_m}m)"
+        )
 
         segment_results: List[Dict[str, Any]] = []
         blocked_in_this_route: List[str] = []
@@ -401,7 +467,9 @@ def run(args: argparse.Namespace) -> None:
                 }
             )
 
-            should_reroute = bool(result.get("reroute_needed")) or not bool(result.get("passable", True))
+            should_reroute = bool(result.get("reroute_needed")) or not bool(
+                result.get("passable", True)
+            )
             if should_reroute:
                 blocked_in_this_route.append(segment.id)
                 blocked_points.append((segment.lat, segment.lng))
@@ -416,7 +484,9 @@ def run(args: argparse.Namespace) -> None:
         )
 
         if blocked_in_this_route:
-            print(f"\n장애물 감지 -> 재탐색: {', '.join(blocked_in_this_route)} 세그먼트 회피")
+            print(
+                f"\n장애물 감지 -> 재탐색: {', '.join(blocked_in_this_route)} 세그먼트 회피"
+            )
             continue
 
         selected = attempts[-1]
@@ -428,20 +498,30 @@ def run(args: argparse.Namespace) -> None:
 
     if selected:
         route = selected["route"]
-        print(f"선택 경로: {route.id} | 거리 {route.distance_m}m | 예상 {route.eta_min}분")
+        print(
+            f"선택 경로: {route.id} | 거리 {route.distance_m}m | 예상 {route.eta_min}분"
+        )
     else:
         print("결과: 최대 루프 내에 안전 경로를 찾지 못했습니다.")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="LM 기반 배리어프리 내비게이션 에이전트 데모")
+    parser = argparse.ArgumentParser(
+        description="LM 기반 배리어프리 내비게이션 에이전트 데모"
+    )
     parser.add_argument("--start", default="서울시청")
     parser.add_argument("--end", default="경복궁역")
     parser.add_argument("--model", default="gpt-4.1-mini")
     parser.add_argument("--max-loops", type=int, default=4)
-    parser.add_argument("--image-mode", choices=["streetview", "local"], default="streetview")
-    parser.add_argument("--local-images", nargs="*", help="local 모드에서 사용할 이미지 경로들")
-    parser.add_argument("--travel-mode", choices=["walking", "bicycling"], default="walking")
+    parser.add_argument(
+        "--image-mode", choices=["streetview", "local"], default="streetview"
+    )
+    parser.add_argument(
+        "--local-images", nargs="*", help="local 모드에서 사용할 이미지 경로들"
+    )
+    parser.add_argument(
+        "--travel-mode", choices=["walking", "bicycling"], default="walking"
+    )
     parser.add_argument("--language", default="ko")
     parser.add_argument("--region", default="kr")
     parser.add_argument("--blocked-radius-m", type=float, default=25.0)
