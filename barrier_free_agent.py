@@ -51,6 +51,7 @@ class GoogleDirectionsMapAPI:
         region: str = "kr",
         mode: str = "walking",
         blocked_radius_m: float = 25.0,
+        field_mask: str = "*",
     ) -> None:
         self.api_key = api_key
         self.origin = origin
@@ -59,6 +60,14 @@ class GoogleDirectionsMapAPI:
         self.region = region
         self.mode = mode
         self.blocked_radius_m = blocked_radius_m
+        self.field_mask = field_mask
+        self.debug_dir: Optional[Path] = None
+        self.request_count: int = 0
+        self.last_debug: Dict[str, Any] = {}
+
+    def set_debug_dir(self, debug_dir: Path) -> None:
+        self.debug_dir = debug_dir
+        self.debug_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _strip_html(text: str) -> str:
@@ -73,6 +82,107 @@ class GoogleDirectionsMapAPI:
         for src, dst in replacements.items():
             out = out.replace(src, dst)
         return " ".join(out.split())
+
+    @staticmethod
+    def _parse_latlng_text(value: str) -> Optional[Tuple[float, float]]:
+        parts = [p.strip() for p in value.split(",")]
+        if len(parts) != 2:
+            return None
+        try:
+            lat = float(parts[0])
+            lng = float(parts[1])
+        except ValueError:
+            return None
+        if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            return None
+        return lat, lng
+
+    def _make_waypoint(self, raw: str) -> Dict[str, Any]:
+        parsed = self._parse_latlng_text(raw)
+        if parsed is None:
+            return {"address": raw}
+        lat, lng = parsed
+        return {
+            "location": {
+                "latLng": {
+                    "latitude": lat,
+                    "longitude": lng,
+                }
+            }
+        }
+
+    @staticmethod
+    def _extract_lat_lng(latlng_obj: Dict[str, Any]) -> Tuple[float, float]:
+        # Routes API commonly uses latitude/longitude keys.
+        lat = latlng_obj.get("lat", latlng_obj.get("latitude", 0.0))
+        lng = latlng_obj.get("lng", latlng_obj.get("longitude", 0.0))
+        return float(lat), float(lng)
+
+    def _nominatim_geocode(self, query: str) -> Tuple[float, float]:
+        url = "https://nominatim.openstreetmap.org/search"
+        params = {"q": query, "format": "json", "limit": 1}
+        headers = {"User-Agent": "barrier-free-agent/1.0"}
+        resp = requests.get(url, params=params, headers=headers, timeout=25)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data:
+            raise RuntimeError(f"Nominatim 좌표 변환 실패: {query}")
+        return float(data[0]["lat"]), float(data[0]["lon"])
+
+    def _call_routes_api(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        self.request_count += 1
+        headers = {
+            "Content-Type": "application/json",
+            "X-Goog-Api-Key": self.api_key,
+            "X-Goog-FieldMask": self.field_mask,
+        }
+
+        resp = requests.post(self.ROUTES_URL, headers=headers, json=body, timeout=30)
+        raw_text = resp.text
+        print(raw_text)
+        try:
+            payload = resp.json()
+        except ValueError:
+            payload = None
+
+        if self.debug_dir is not None:
+            debug_meta_path = (
+                self.debug_dir / f"routes_response_{self.request_count:02d}_meta.txt"
+            )
+            debug_meta_path.write_text(
+                "\n".join(
+                    [
+                        f"status_code={resp.status_code}",
+                        f"content_type={resp.headers.get('Content-Type', '')}",
+                        f"body_preview={raw_text[:1000]}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+        if payload is None:
+            raise RuntimeError(
+                f"Google Routes 응답 파싱 실패: HTTP {resp.status_code}, body={raw_text[:300]}"
+            )
+        if resp.status_code >= 400:
+            error = payload.get("error", {})
+            code = error.get("status", f"HTTP_{resp.status_code}")
+            msg = error.get("message", raw_text[:300])
+            raise RuntimeError(f"Google Routes 오류: {code} - {msg}")
+        if "error" in payload:
+            error = payload.get("error", {})
+            code = error.get("status", "UNKNOWN")
+            msg = error.get("message", "Routes API 호출 실패")
+            raise RuntimeError(f"Google Routes 오류: {code} - {msg}")
+
+        if self.debug_dir is not None:
+            debug_payload_path = (
+                self.debug_dir / f"routes_response_{self.request_count:02d}.json"
+            )
+            debug_payload_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        return payload
 
     @staticmethod
     def _parse_duration_seconds(duration_text: str) -> int:
@@ -135,59 +245,103 @@ class GoogleDirectionsMapAPI:
         self, blocked_points: Optional[List[Tuple[float, float]]] = None
     ) -> List[Route]:
         blocked_points = blocked_points or []
-        headers = {
-            "Content-Type": "application/json",
-            "X-Goog-Api-Key": self.api_key,
-            "X-Goog-FieldMask": (
-                "routes.duration,routes.distanceMeters,routes.description,"
-                "routes.legs.steps.startLocation,routes.legs.steps.endLocation,"
-                "routes.legs.steps.navigationInstruction.instructions"
-            ),
-        }
-        body = {
-            "origin": {"address": self.origin},
-            "destination": {"address": self.destination},
+        body_address = {
+            "origin": self._make_waypoint(self.origin),
+            "destination": self._make_waypoint(self.destination),
             "travelMode": self._travel_mode_for_routes_api(),
-            "computeAlternativeRoutes": True,
+            "computeAlternativeRoutes": False,
+            "routeModifiers": {
+                "avoidTolls": False,
+                "avoidHighways": False,
+                "avoidFerries": False,
+            },
             "languageCode": self.language,
-            "regionCode": self.region.upper(),
             "units": "METRIC",
         }
+        payload = self._call_routes_api(body_address)
+        used_fallback = False
 
-        resp = requests.post(self.ROUTES_URL, headers=headers, json=body, timeout=30)
-        try:
-            payload = resp.json()
-        except ValueError:
-            payload = {}
-        if resp.status_code >= 400:
-            error = payload.get("error", {})
-            code = error.get("status", f"HTTP_{resp.status_code}")
-            msg = error.get("message", resp.text[:300])
-            raise RuntimeError(f"Google Routes 오류: {code} - {msg}")
-        if "error" in payload:
-            error = payload.get("error", {})
-            code = error.get("status", "UNKNOWN")
-            msg = error.get("message", "Routes API 호출 실패")
-            raise RuntimeError(f"Google Routes 오류: {code} - {msg}")
+        if not payload.get("routes"):
+            # Fallback: geocode with Nominatim and call Routes with explicit coordinates.
+            o_lat, o_lng = self._nominatim_geocode(self.origin)
+            d_lat, d_lng = self._nominatim_geocode(self.destination)
+            body_latlng = {
+                "origin": {
+                    "location": {
+                        "latLng": {
+                            "latitude": o_lat,
+                            "longitude": o_lng,
+                        }
+                    }
+                },
+                "destination": {
+                    "location": {
+                        "latLng": {
+                            "latitude": d_lat,
+                            "longitude": d_lng,
+                        }
+                    }
+                },
+                "travelMode": self._travel_mode_for_routes_api(),
+                "computeAlternativeRoutes": False,
+                "routeModifiers": {
+                    "avoidTolls": False,
+                    "avoidHighways": False,
+                    "avoidFerries": False,
+                },
+                "languageCode": self.language,
+                "units": "METRIC",
+            }
+            payload = self._call_routes_api(body_latlng)
+            used_fallback = True
+
+        counters = {
+            "api_routes_total": len(payload.get("routes", [])),
+            "skipped_no_legs": 0,
+            "skipped_no_steps": 0,
+            "skipped_blocked": 0,
+            "accepted": 0,
+            "payload_keys": ",".join(sorted(payload.keys())),
+            "used_nominatim_fallback": 1 if used_fallback else 0,
+        }
 
         routes: List[Route] = []
         for r_idx, r in enumerate(payload.get("routes", []), start=1):
             legs = r.get("legs", [])
             if not legs:
+                counters["skipped_no_legs"] += 1
                 continue
             leg = legs[0]
             steps = leg.get("steps", [])
             if not steps:
-                continue
+                counters["skipped_no_steps"] += 1
+                start = leg.get("startLocation", {}).get("latLng", {})
+                end = leg.get("endLocation", {}).get("latLng", {})
+                slat = float(start.get("lat", 0.0))
+                slng = float(start.get("lng", 0.0))
+                elat = float(end.get("lat", slat))
+                elng = float(end.get("lng", slng))
+                if slat != 0.0 or slng != 0.0:
+                    steps = [
+                        {
+                            "startLocation": {"latLng": {"lat": slat, "lng": slng}},
+                            "endLocation": {"latLng": {"lat": elat, "lng": elng}},
+                            "navigationInstruction": {
+                                "instructions": "Route-level fallback segment"
+                            },
+                        }
+                    ]
+                else:
+                    continue
 
             segments: List[Segment] = []
             for s_idx, step in enumerate(steps, start=1):
                 start_loc = step.get("startLocation", {}).get("latLng", {})
                 end_loc = step.get("endLocation", {}).get("latLng", {})
-                lat = float(start_loc.get("lat", 0.0))
-                lng = float(start_loc.get("lng", 0.0))
-                end_lat = float(end_loc.get("lat", lat))
-                end_lng = float(end_loc.get("lng", lng))
+                lat, lng = self._extract_lat_lng(start_loc)
+                end_lat, end_lng = self._extract_lat_lng(end_loc)
+                if end_lat == 0.0 and end_lng == 0.0:
+                    end_lat, end_lng = lat, lng
                 heading = self._bearing(lat, lng, end_lat, end_lng)
                 nav = step.get("navigationInstruction", {})
                 name = self._strip_html(nav.get("instructions", f"step_{s_idx}"))
@@ -209,6 +363,7 @@ class GoogleDirectionsMapAPI:
             if blocked_points and any(
                 self._is_near_blocked_point(seg, blocked_points) for seg in segments
             ):
+                counters["skipped_blocked"] += 1
                 continue
 
             summary = r.get("description") or "Google Routes 경로"
@@ -223,6 +378,9 @@ class GoogleDirectionsMapAPI:
                     segments=segments,
                 )
             )
+            counters["accepted"] += 1
+
+        self.last_debug = counters
 
         return sorted(routes, key=lambda x: (x.distance_m, x.eta_min))
 
@@ -408,12 +566,16 @@ def run(args: argparse.Namespace) -> None:
         region=args.region,
         mode=args.travel_mode,
         blocked_radius_m=args.blocked_radius_m,
+        field_mask=args.routes_field_mask,
     )
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = Path("runs") / f"run_{ts}"
     img_dir = run_dir / "images"
+    debug_dir = run_dir / "debug"
     img_dir.mkdir(parents=True, exist_ok=True)
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    map_api.set_debug_dir(debug_dir)
 
     blocked_points: List[Tuple[float, float]] = []
     attempts: List[Dict[str, Any]] = []
@@ -424,12 +586,25 @@ def run(args: argparse.Namespace) -> None:
     print(f"도착지: {args.end}")
     print(f"모델: {args.model}")
     print(f"이미지 모드: {args.image_mode}")
-    print(f"지도 경로 모드: Google Directions ({args.travel_mode})")
+    print(f"지도 경로 모드: Google Routes ({args.travel_mode})")
+    print(f"Routes field mask: {args.routes_field_mask}")
+    print(f"디버그 응답 저장: {debug_dir.resolve()}")
 
     for loop_idx in range(1, args.max_loops + 1):
         candidates = map_api.get_routes(blocked_points=blocked_points)
+        dbg = map_api.last_debug or {}
+        print(
+            f"[Loop {loop_idx}] API routes={dbg.get('api_routes_total', 0)} "
+            f"accepted={dbg.get('accepted', 0)} "
+            f"keys={dbg.get('payload_keys', '')} "
+            f"nominatim_fallback={dbg.get('used_nominatim_fallback', 0)} "
+            f"skip(no_legs={dbg.get('skipped_no_legs', 0)}, "
+            f"no_steps={dbg.get('skipped_no_steps', 0)}, blocked={dbg.get('skipped_blocked', 0)})"
+        )
         if not candidates:
-            print("\n더 이상 후보 경로가 없습니다.")
+            print(
+                "\n더 이상 후보 경로가 없습니다. debug 폴더의 routes_response_*.json을 확인하세요."
+            )
             break
 
         route = candidates[0]
@@ -509,8 +684,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="LM 기반 배리어프리 내비게이션 에이전트 데모"
     )
-    parser.add_argument("--start", default="서울시청")
-    parser.add_argument("--end", default="경복궁역")
+    parser.add_argument("--start", default="37.419734,-122.0827784")
+    parser.add_argument("--end", default="37.417670,-122.079595")
     parser.add_argument("--model", default="gpt-4.1-mini")
     parser.add_argument("--max-loops", type=int, default=4)
     parser.add_argument(
@@ -522,9 +697,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--travel-mode", choices=["walking", "bicycling"], default="walking"
     )
-    parser.add_argument("--language", default="ko")
-    parser.add_argument("--region", default="kr")
+    parser.add_argument("--language", default="en-US")
+    parser.add_argument("--region", default="us")
     parser.add_argument("--blocked-radius-m", type=float, default=25.0)
+    parser.add_argument("--routes-field-mask", default="*")
     parser.add_argument("--openai-api-key", default=None)
     parser.add_argument("--google-maps-api-key", default=None)
 
